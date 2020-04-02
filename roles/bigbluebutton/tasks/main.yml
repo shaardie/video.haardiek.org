@@ -64,6 +64,18 @@
       line: moderatorsJoinViaHTML5Client=true
   notify: restart bbb
 
+- name: turn off muted sound
+  replace:
+    path: /opt/freeswitch/etc/freeswitch/autoload_configs/conference.conf.xml
+    regexp: '{{ item.regexp }}'
+    replace: '{{ item.line }}'
+  loop:
+    - {regexp: ' (<param name="muted-sound".*>)$',
+       line: ' <!--\1-->'}
+    - {regexp: ' (<param name="unmuted-sound".*>)$',
+       line: ' <!--\1-->'}
+  notify: restart bbb
+
 - name: check hostname
   command: grep -q '^screenshareRtmpServer={{ inventory_hostname }}$' /usr/share/bbb-web/WEB-INF/classes/bigbluebutton.properties
   register: hostname_is_set
