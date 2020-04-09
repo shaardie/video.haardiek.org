@@ -5,13 +5,17 @@
     that: ansible_distribution == 'Ubuntu' and ansible_distribution_version == '16.04'
   when: not skip_distribution_check
 
+- name: allow apt to communicate via https
+  apt:
+    name: apt-transport-https
+
 - name: add additional repositories
   apt_repository:
     repo: '{{ item }}'
+    update_cache: no
   with_items:
     - ppa:bigbluebutton/support
     - ppa:rmescandon/yq
-    - ppa:certbot/certbot
     - deb [ arch=amd64,arm64 ] http://repo.mongodb.org/apt/ubuntu xenial/mongodb-org/3.4 multiverse
     - deb https://deb.nodesource.com/node_8.x xenial main
     - deb https://ubuntu.bigbluebutton.org/xenial-220/ bigbluebutton-xenial main
@@ -21,8 +25,12 @@
     url: '{{ item }}'
   with_items:
     - https://www.mongodb.org/static/pgp/server-3.4.asc
-    - https://deb.nodesource.com/gpgkey/nodesource.gpg.key
     - https://ubuntu.bigbluebutton.org/repo/bigbluebutton.asc
+
+- name: add NodeSource apt keys
+  apt_key:
+    keyserver: keyserver.ubuntu.com
+    id: 9FD3B784BC1C6FC31A8A0A1C1655A0AB68576280
 
 - name: install dependencies
   apt:
@@ -34,9 +42,14 @@
       - openjdk-8-jdk
       - nodejs
       - bigbluebutton
+      - ufw
+  notify: restart bbb
+
+- name: install bbb-html5
+  apt:
+    update_cache: true
+    name:
       - bbb-html5
-      - certbot
-      - python-certbot-nginx
   notify: restart bbb
 
 - name: make html5 client the default client
@@ -51,20 +64,47 @@
       line: moderatorsJoinViaHTML5Client=true
   notify: restart bbb
 
+- name: turn off muted sound
+  replace:
+    path: /opt/freeswitch/etc/freeswitch/autoload_configs/conference.conf.xml
+    regexp: '{{ item.regexp }}'
+    replace: '{{ item.line }}'
+  loop:
+    - {regexp: ' (<param name="muted-sound".*>)$',
+       line: ' <!--\1-->'}
+    - {regexp: ' (<param name="unmuted-sound".*>)$',
+       line: ' <!--\1-->'}
+  notify: restart bbb
+
+- name: check hostname
+  command: grep -q '^screenshareRtmpServer={{ inventory_hostname }}$' /usr/share/bbb-web/WEB-INF/classes/bigbluebutton.properties
+  register: hostname_is_set
+  ignore_errors: true
+
 - name: set hostname in bbb
-  command: bbb-conf --setip {{ ansible_host }}
+  command: bbb-conf --setip {{ inventory_hostname }}
   notify: restart bbb
+  when: hostname_is_set is failed
 
-- name: create certificate
-  command: certbot certonly --domain {{ ansible_host }} --nginx --agree-tos -m {{ email }}
-  args:
-    creates: /etc/letsencrypt/live/{{ ansible_host }}/cert.pem
-  notify: restart bbb
-
-- name: nginx ssl directory
+- name: create nginx ssl directory
   file:
     state: directory
     dest: /etc/nginx/ssl/
+
+- name: install tls certificate (if none exists)
+  copy:
+    src: '{{ item.source }}'
+    dest: /etc/nginx/ssl/{{ item.target }}
+    owner: root
+    group: root
+    mode: '0400'
+    force: false
+  notify: reload nginx
+  loop:
+    - {source: certificate.pem,
+       target: '{{ inventory_hostname }}.crt'}
+    - {source: key.pem,
+       target: '{{ inventory_hostname }}.key'}
 
 - name: diffie hellmann parameter from https://ssl-config.mozilla.org/ffdhe2048.txt
   copy:
@@ -72,21 +112,34 @@
     dest: /etc/nginx/ssl/dhparam.pem
   notify: reload nginx
 
-- name: configure NGINX for bbb
+- name: remove nginx default config
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx
+
+- name: configure nginx for bigbluebutton
   blockinfile:
     path: /etc/nginx/sites-available/bigbluebutton
-    insertafter: 'server {'
+    insertbefore: 'server_name'
     marker_begin: 'BEGIN BBB'
     marker_end: 'END BBB'
     block: |
+        server_name _;
+        location / {
+        return 301 https://{{ inventory_hostname }}$request_uri;
+        }
+        }
+
+        server {
         listen 443 ssl;
         listen [::]:443 ssl;
 
-        ssl_certificate /etc/letsencrypt/live/{{ ansible_host }}/fullchain.pem;
-        ssl_certificate_key /etc/letsencrypt/live/{{ ansible_host }}/privkey.pem;
+        ssl_certificate /etc/nginx/ssl/{{ inventory_hostname }}.crt;
+        ssl_certificate_key /etc/nginx/ssl/{{ inventory_hostname }}.key;
         ssl_session_cache shared:SSL:10m;
         ssl_session_timeout 10m;
-        ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+        ssl_protocols TLSv1.1 TLSv1.2;
         ssl_ciphers "ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:RSA+AESGCM:RSA+AES:RSA+3DES:!aNULL:!MD5:!DSS:!AES256";
         ssl_prefer_server_ciphers on;
         ssl_dhparam /etc/nginx/ssl/dhparam.pem;
@@ -133,8 +186,35 @@
       replace: 'playback_protocol: https'
   notify: restart bbb
 
+- name: check secret
+  command: grep -q '^securitySalt={{ secrets[inventory_hostname].bigbluebutton }}$' /usr/share/bbb-web/WEB-INF/classes/bigbluebutton.properties
+  register: secret_is_set
+  ignore_errors: true
+
 - name: set secret
-  command: bbb-conf --setsecret {{ bbb_secret }}
+  command: bbb-conf --setsecret {{ secrets[inventory_hostname].bigbluebutton }}
+  notify: restart bbb
+  when: secret_is_set is failed
+
+- name: configure default camere quality
+  replace:
+    path: /usr/share/meteor/bundle/programs/server/assets/app/config/settings.yml
+    after: '- id: *{{ item.id }}'
+    before: '-'
+    regexp: 'default: *.*$'
+    replace: 'default: {{ item.default }}'
+  loop:
+    - {id: low, default: 'true'}
+    - {id: medium, default: 'false'}
+    - {id: high, default: 'false'}
+    - {id: hd, default: 'false'}
+  notify: restart bbb
+
+- name: disable recording button
+  lineinfile:
+    path: /usr/share/bbb-web/WEB-INF/classes/bigbluebutton.properties
+    regexp: '^allowStartStopRecording='
+    line: 'allowStartStopRecording=false'
   notify: restart bbb
 
 - name: ufw allow known services
